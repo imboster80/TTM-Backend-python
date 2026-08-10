@@ -4,8 +4,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-MONGO_URI = os.getenv("MONGO_URI") or os.getenv("MONGODB_URI") or "mongodb://localhost:27017/ttm_db"
+# 4. Database Connection Check
+MONGO_URI = os.getenv("MONGO_URI")
+
+if not MONGO_URI:
+    raise Exception("MONGO_URI is not set in Environment Variables!")
 
 client = AsyncIOMotorClient(MONGO_URI)
-# Database နာမည်ကို တိုက်ရိုက်သတ်မှတ်ပေးခြင်း
-db = client.get_database("ttm_db")
+# Database နာမည်အမှန်ကို ဤနေရာတွင် ထည့်ပါ
+db = client["ttm_db"]
