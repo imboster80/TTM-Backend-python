@@ -7,4 +7,5 @@ load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI") or os.getenv("MONGODB_URI") or "mongodb://localhost:27017/ttm_db"
 
 client = AsyncIOMotorClient(MONGO_URI)
-db = client.get_database()
+# Database နာမည်ကို တိုက်ရိုက်သတ်မှတ်ပေးခြင်း
+db = client.get_database("ttm_db")
