@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+motor
+pymongo
+ddddocr
+passlib[bcrypt]
+pyjwt
+python-multipart
+python-dotenv
+requests
