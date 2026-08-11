@@ -1,4 +1,4 @@
-import os, datetime, jwt
+import os, datetime, jwt, logging
 from fastapi import FastAPI, Request, HTTPException, Depends, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +8,10 @@ from bson import ObjectId
 from passlib.context import CryptContext
 from app.database import db
 from app.utils import solve_image_ocr
+
+# Logging Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -46,8 +50,11 @@ class CreateCodeRequest(BaseModel):
 class RedeemCodeRequest(BaseModel):
     code: str
 
-class GenerateKeyRequest(BaseModel):
-    expiry_hours: float
+# --- Helper to convert Mongo to JSON ---
+def fix_id(doc):
+    if doc:
+        doc["_id"] = str(doc["_id"])
+    return doc
 
 # --- Auth Helper ---
 async def get_current_user(request: Request):
@@ -55,7 +62,9 @@ async def get_current_user(request: Request):
     if not auth_header:
         raise HTTPException(status_code=401, detail="Missing token")
     
-    token = auth_header.split(" ")[1] if " " in auth_header else auth_header
+    parts = auth_header.split()
+    token = parts[1] if len(parts) > 1 else parts[0]
+    
     if token == HARDCODED_DEV_TOKEN:
         return {"_id": "000000000000000000000000", "username": "MasterDeveloper", "role": "Developer"}
     
@@ -64,7 +73,8 @@ async def get_current_user(request: Request):
         user = await db.users.find_one({"_id": ObjectId(payload.get("id"))})
         if not user: raise HTTPException(status_code=401, detail="User not found")
         return user
-    except:
+    except Exception as e:
+        logger.error(f"Auth error: {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # --- Routes ---
@@ -75,31 +85,40 @@ async def root():
 
 @app.post("/api/auth/register")
 async def register(req: RegisterRequest):
-    existing = await db.users.find_one({"username": req.username})
-    if existing: return {"success": False, "detail": "Username exists"}
-    new_user = {
-        "username": req.username,
-        "password_hash": pwd_context.hash(req.password),
-        "role": req.role,
-        "vip_expiry": None,
-        "is_banned": False,
-        "created_at": datetime.datetime.utcnow()
-    }
-    await db.users.insert_one(new_user)
-    return {"success": True, "message": "Registered successfully"}
+    try:
+        existing = await db.users.find_one({"username": req.username})
+        if existing: return {"success": False, "detail": "Username exists"}
+        new_user = {
+            "username": req.username,
+            "password_hash": pwd_context.hash(req.password),
+            "role": req.role,
+            "vip_expiry": None,
+            "is_banned": False,
+            "created_at": datetime.datetime.utcnow()
+        }
+        await db.users.insert_one(new_user)
+        return {"success": True, "message": "Registered successfully"}
+    except Exception as e:
+        logger.error(f"Register error: {str(e)}")
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
 
 @app.post("/api/auth/login")
 async def login(req: LoginRequest):
-    user = await db.users.find_one({"username": req.username})
-    if not user or user.get("is_banned") or not pwd_context.verify(req.password, user["password_hash"]):
-        return {"success": False, "detail": "Invalid credentials"}
-    token = jwt.encode({"id": str(user["_id"]), "role": user["role"]}, JWT_SECRET, algorithm=ALGORITHM)
-    return {"success": True, "token": token, "role": user["role"]}
+    try:
+        user = await db.users.find_one({"username": req.username})
+        if not user or user.get("is_banned") or not pwd_context.verify(req.password, user["password_hash"]):
+            return {"success": False, "detail": "Invalid credentials"}
+        token = jwt.encode({"id": str(user["_id"]), "role": user["role"]}, JWT_SECRET, algorithm=ALGORITHM)
+        return {"success": True, "token": token, "role": user["role"]}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
 
 @app.get("/api/auth/me")
 async def get_me(user: dict = Depends(get_current_user)):
     now = datetime.datetime.utcnow()
-    is_vip = user.get("vip_expiry") is not None and user["vip_expiry"] > now
+    is_vip = False
+    if user.get("vip_expiry"):
+        is_vip = user["vip_expiry"] > now
     return {
         "success": True,
         "user": {
@@ -113,8 +132,8 @@ async def get_me(user: dict = Depends(get_current_user)):
 
 @app.post("/api/utils/solve-captcha")
 async def solve_captcha(request: Request):
-    image_bytes = await request.body()
     try:
+        image_bytes = await request.body()
         text = solve_image_ocr(image_bytes)
         return {"success": True, "message": text}
     except Exception as e:
@@ -122,9 +141,12 @@ async def solve_captcha(request: Request):
 
 @app.get("/api/profiles")
 async def get_profiles(user: dict = Depends(get_current_user)):
-    profiles = await db.profiles.find({"user_id": str(user["_id"])}).to_list(100)
-    for p in profiles: p["_id"] = str(p["_id"])
-    return {"success": True, "profiles": profiles}
+    try:
+        cursor = db.profiles.find({"user_id": str(user["_id"])})
+        profiles = await cursor.to_list(length=100)
+        return {"success": True, "profiles": [fix_id(p) for p in profiles]}
+    except Exception as e:
+        return {"success": False, "detail": str(e)}
 
 @app.post("/api/profiles")
 async def save_profile(data: ProfileData, user: dict = Depends(get_current_user)):
@@ -146,8 +168,12 @@ async def redeem_code(req: RedeemCodeRequest, user: dict = Depends(get_current_u
     code_doc = await db.redeem_codes.find_one({"code": req.code})
     if not code_doc or code_doc["used_count"] >= code_doc["max_uses"]:
         return {"success": False, "detail": "Invalid or expired code"}
+    
     now = datetime.datetime.utcnow()
-    current_expiry = user["vip_expiry"] if (user.get("vip_expiry") and user["vip_expiry"] > now) else now
+    current_expiry = user.get("vip_expiry")
+    if not current_expiry or current_expiry < now:
+        current_expiry = now
+        
     new_expiry = current_expiry + datetime.timedelta(hours=code_doc["hours"])
     await db.users.update_one({"_id": user["_id"]}, {"$set": {"vip_expiry": new_expiry}})
     await db.redeem_codes.update_one({"_id": code_doc["_id"]}, {"$inc": {"used_count": 1}})
@@ -156,18 +182,21 @@ async def redeem_code(req: RedeemCodeRequest, user: dict = Depends(get_current_u
 @app.get("/api/admin/codes/all")
 async def get_all_codes(user: dict = Depends(get_current_user)):
     if user["role"] not in ["Admin", "Developer"]: raise HTTPException(403)
-    codes = await db.redeem_codes.find().to_list(100)
-    for c in codes: c["_id"] = str(c["_id"])
-    return {"success": True, "codes": codes}
+    cursor = db.redeem_codes.find()
+    codes = await cursor.to_list(length=100)
+    return {"success": True, "codes": [fix_id(c) for c in codes]}
 
 @app.get("/api/dev/users/all")
 async def get_all_users(user: dict = Depends(get_current_user)):
     if user["role"] != "Developer": raise HTTPException(403)
-    users = await db.users.find().to_list(500)
-    for u in users: 
+    cursor = db.users.find()
+    users = await cursor.to_list(length=500)
+    res = []
+    for u in users:
         u["_id"] = str(u["_id"])
         if "password_hash" in u: u.pop("password_hash")
-    return {"success": True, "users": users}
+        res.append(u)
+    return {"success": True, "users": res}
 
 @app.get("/api/dev/dashboard-stats")
 async def get_stats(user: dict = Depends(get_current_user)):
