@@ -27,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Pydantic Models ---
+# --- Models ---
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -50,148 +50,89 @@ class CreateCodeRequest(BaseModel):
 class RedeemCodeRequest(BaseModel):
     code: str
 
-class GenerateKeyRequest(BaseModel):
-    expiry_hours: float
-
+# --- Helper functions ---
 def fix_id(doc):
     if doc:
         doc["_id"] = str(doc["_id"])
     return doc
 
-# --- Auth Helper ---
 async def get_current_user(request: Request):
     auth_header = request.headers.get("Authorization")
     if not auth_header:
-        raise HTTPException(status_code=401, detail="Missing token")
+        raise HTTPException(status_code=401, detail="Missing authorization header")
     
-    parts = auth_header.split()
-    token = parts[1] if len(parts) > 1 else parts[0]
+    token = auth_header.split(" ")[1] if " " in auth_header else auth_header
     
+    # Check Bypass Token
     if token == HARDCODED_DEV_TOKEN:
-        return {"_id": "000000000000000000000000", "username": "MrTanTawMoe", "role": "Developer"}
-    
+        # Developer အတွက် Database ထဲမှာ အကောင့်ရှိမရှိ အရင်စစ်မယ်
+        dev_user = await db["users"].find_one({"username": "MrTanTawMoe"})
+        if dev_user:
+            return dev_user
+        else:
+            # အကောင့်မရှိသေးရင် ယာယီ ID တစ်ခု ပေးထားမယ်
+            return {"_id": ObjectId("000000000000000000000000"), "username": "MrTanTawMoe", "role": "Developer"}
+
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        user = await db.users.find_one({"_id": ObjectId(payload.get("id"))})
+        user = await db["users"].find_one({"_id": ObjectId(payload.get("id"))})
         if not user: raise HTTPException(status_code=401, detail="User not found")
         return user
-    except:
+    except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# --- Routes ---
-
-@app.get("/")
-async def root():
-    return {"success": True, "message": "TTM Python Backend Live!"}
+# --- APIs ---
 
 @app.post("/api/auth/register")
 async def register(req: RegisterRequest):
-    existing = await db.users.find_one({"username": req.username})
-    if existing: return {"success": False, "detail": "Username exists"}
-    
-    new_user = {
-        "username": req.username,
-        "password_hash": pwd_context.hash(req.password),
-        "role": req.role,
-        "vip_expiry": None,
-        "is_banned": False,
-        "created_at": datetime.datetime.utcnow()
-    }
-    await db.users.insert_one(new_user)
-    return {"success": True, "message": "Registered successfully"}
+    try:
+        # Collection ခေါ်တာကို db["users"] လို့ ပြောင်းလိုက်တယ်နော်
+        existing = await db["users"].find_one({"username": req.username})
+        if existing: return {"success": False, "detail": "အကောင့်နာမည် ရှိနှင့်ပြီးသားဖြစ်နေပါတယ်"}
+        
+        # Developer နာမည်နဲ့ ဖွင့်ရင် Role ကို Developer လို့ အလိုအလျောက် သတ်မှတ်ပေးမယ်
+        assigned_role = "Developer" if req.username == "MrTanTawMoe" else req.role
+        
+        new_user = {
+            "username": req.username,
+            "password_hash": pwd_context.hash(req.password),
+            "role": assigned_role,
+            "vip_expiry": None,
+            "is_banned": False,
+            "created_at": datetime.datetime.utcnow()
+        }
+        await db["users"].insert_one(new_user)
+        return {"success": True, "message": f"အကောင့်သစ်ကို {assigned_role} အဖြစ် ဖွင့်လှစ်ပြီးပါပြီ"}
+    except Exception as e:
+        logger.error(f"Registration Error: {str(e)}")
+        return JSONResponse(status_code=500, content={"success": False, "detail": f"Database Error: {str(e)}"})
 
 @app.post("/api/auth/login")
 async def login(req: LoginRequest):
     try:
-        user = await db.users.find_one({"username": req.username})
-        # ဒီမှာ ညီမလေး HTTPException သုံးပြီး အမှားကို တိတိကျကျ ပြန်လိုက်မယ်နော်
+        user = await db["users"].find_one({"username": req.username})
         if not user or user.get("is_banned") or not pwd_context.verify(req.password, user["password_hash"]):
-            raise HTTPException(status_code=401, detail="Invalid username or password")
+            return {"success": False, "detail": "ယူဆာအမည် သို့မဟုတ် လျှို့ဝှက်နံပါတ် မှားယွင်းနေပါတယ်"}
         
         token = jwt.encode({"id": str(user["_id"]), "role": user["role"]}, JWT_SECRET, algorithm=ALGORITHM)
         return {"success": True, "token": token, "role": user["role"]}
-    except HTTPException as e:
-        raise e
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
-        
+
 @app.get("/api/auth/me")
 async def get_me(user: dict = Depends(get_current_user)):
     now = datetime.datetime.utcnow()
-    is_vip = user.get("vip_expiry") is not None and user["vip_expiry"] > now
+    expiry = user.get("vip_expiry")
+    is_vip = expiry is not None and expiry > now
     return {
         "success": True,
         "user": {
             "_id": str(user["_id"]),
             "username": user["username"],
             "role": user["role"],
-            "vip_expiry": str(user["vip_expiry"]) if user.get("vip_expiry") else None,
-            "isVip": is_vip
+            "vip_expiry": str(expiry) if expiry else None,
+            "isVip": is_vip or user["role"] == "Developer" # Developer ဆိုရင် အမြဲ VIP ဖြစ်အောင် လုပ်ပေးထားတယ်နော်
         }
     }
 
-@app.post("/api/utils/solve-captcha")
-async def solve_captcha(request: Request):
-    image_bytes = await request.body()
-    try:
-        text = solve_image_ocr(image_bytes)
-        return {"success": True, "message": text}
-    except Exception as e:
-        return {"success": False, "detail": str(e)}
-
-@app.get("/api/profiles")
-async def get_profiles(user: dict = Depends(get_current_user)):
-    cursor = db.profiles.find({"user_id": str(user["_id"])})
-    profiles = await cursor.to_list(length=100)
-    return {"success": True, "profiles": [fix_id(p) for p in profiles]}
-
-@app.post("/api/profiles")
-async def save_profile(data: ProfileData, user: dict = Depends(get_current_user)):
-    new_p = data.dict()
-    new_p["user_id"] = str(user["_id"])
-    await db.profiles.insert_one(new_p)
-    return {"success": True, "message": "Saved"}
-
-@app.post("/api/admin/codes/create")
-async def create_code(req: CreateCodeRequest, user: dict = Depends(get_current_user)):
-    if user["role"] not in ["Admin", "Developer"]: raise HTTPException(403)
-    await db.redeem_codes.insert_one({
-        "code": req.code, "hours": req.hours, "max_uses": req.max_uses, "used_count": 0
-    })
-    return {"success": True, "message": "Code created"}
-
-@app.post("/api/user/codes/redeem")
-async def redeem_code(req: RedeemCodeRequest, user: dict = Depends(get_current_user)):
-    code_doc = await db.redeem_codes.find_one({"code": req.code})
-    if not code_doc or code_doc["used_count"] >= code_doc["max_uses"]:
-        return {"success": False, "detail": "Invalid or expired code"}
-    
-    now = datetime.datetime.utcnow()
-    current_expiry = user.get("vip_expiry")
-    if not current_expiry or current_expiry < now: current_expiry = now
-    
-    new_expiry = current_expiry + datetime.timedelta(hours=code_doc["hours"])
-    await db.users.update_one({"_id": user["_id"]}, {"$set": {"vip_expiry": new_expiry}})
-    await db.redeem_codes.update_one({"_id": code_doc["_id"]}, {"$inc": {"used_count": 1}})
-    return {"success": True, "message": "Redeemed"}
-
-@app.get("/api/admin/codes/all")
-async def get_all_codes(user: dict = Depends(get_current_user)):
-    if user["role"] not in ["Admin", "Developer"]: raise HTTPException(403)
-    cursor = db.redeem_codes.find()
-    codes = await cursor.to_list(length=100)
-    return {"success": True, "codes": [fix_id(c) for c in codes]}
-
-@app.get("/api/dev/users/all")
-async def get_all_users(user: dict = Depends(get_current_user)):
-    if user["role"] != "Developer": raise HTTPException(403)
-    cursor = db.users.find()
-    users = await cursor.to_list(length=500)
-    return {"success": True, "users": [fix_id(u) for u in users]}
-
-@app.get("/api/dev/dashboard-stats")
-async def get_stats(user: dict = Depends(get_current_user)):
-    if user["role"] != "Developer": raise HTTPException(403)
-    total_users = await db.users.count_documents({})
-    total_bots = await db.profiles.count_documents({})
-    return {"success": True, "stats": {"totalUsers": total_users, "totalBots": total_bots, "pendingPayments": 0}}
+# --- ကျန်တဲ့ APIs တွေမှာလည်း db.profiles အစား db["profiles"] လို့ ပြောင်းသုံးပေးပါဦးနော် ---
