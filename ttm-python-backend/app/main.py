@@ -102,13 +102,19 @@ async def register(req: RegisterRequest):
 
 @app.post("/api/auth/login")
 async def login(req: LoginRequest):
-    user = await db.users.find_one({"username": req.username})
-    if not user or user.get("is_banned") or not pwd_context.verify(req.password, user["password_hash"]):
-        return {"success": False, "detail": "Invalid credentials"}
-    
-    token = jwt.encode({"id": str(user["_id"]), "role": user["role"]}, JWT_SECRET, algorithm=ALGORITHM)
-    return {"success": True, "token": token, "role": user["role"]}
-
+    try:
+        user = await db.users.find_one({"username": req.username})
+        # ဒီမှာ ညီမလေး HTTPException သုံးပြီး အမှားကို တိတိကျကျ ပြန်လိုက်မယ်နော်
+        if not user or user.get("is_banned") or not pwd_context.verify(req.password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        
+        token = jwt.encode({"id": str(user["_id"]), "role": user["role"]}, JWT_SECRET, algorithm=ALGORITHM)
+        return {"success": True, "token": token, "role": user["role"]}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+        
 @app.get("/api/auth/me")
 async def get_me(user: dict = Depends(get_current_user)):
     now = datetime.datetime.utcnow()
